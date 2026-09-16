@@ -1,0 +1,6 @@
+name: Custodian
+version: '${version}'
+
+main: com.axl.custodian.Custodian
+api-version: '1.18'
+load: STARTUP
