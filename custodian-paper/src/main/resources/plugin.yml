@@ -1,6 +1,5 @@
 name: Custodian
 version: '${version}'
-
-main: com.axl.custodian.Custodian
+main: com.axl.custodian.paper.CustodianPlugin
 api-version: '1.18'
 load: STARTUP

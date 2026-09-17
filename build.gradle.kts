@@ -1,34 +1,15 @@
-plugins {
-    id("java-library")
-    id("xyz.jpenilla.run-paper") version "3.0.2"
+plugins { id("base") }
+
+allprojects {
+    group = "com.axl.custodian"
+    version = "0.1.0-SNAPSHOT"
+    repositories { mavenCentral(); maven("https://repo.papermc.io/repository/maven-public/") }
 }
 
-repositories {
-    mavenCentral()
-    maven("https://repo.papermc.io/repository/maven-public/")
-}
-
-dependencies {
-    compileOnly("io.papermc.paper:paper-api:1.18.2-R0.1-SNAPSHOT")
-}
-
-java {
-    toolchain.languageVersion = JavaLanguageVersion.of(17)
-}
-
-tasks {
-    runServer {
-        // Configure the Minecraft version for our task.
-        // This is the only required configuration besides applying the plugin.
-        // Your plugin's jar (or shadowJar if present) will be used automatically.
-        minecraftVersion("1.18.2")
-        jvmArgs("-Xms2G", "-Xmx2G")
-    }
-
-    processResources {
-        val props = mapOf("version" to version)
-        filesMatching("plugin.yml") {
-            expand(props)
-        }
+subprojects {
+    plugins.withId("java-library") {
+        extensions.configure<JavaPluginExtension> { toolchain.languageVersion = JavaLanguageVersion.of(17) }
+        tasks.withType<JavaCompile>().configureEach { options.release = 17; options.encoding = "UTF-8" }
+        tasks.withType<Test>().configureEach { useJUnitPlatform() }
     }
 }

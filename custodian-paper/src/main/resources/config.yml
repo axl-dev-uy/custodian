@@ -1,0 +1,3 @@
+server-id: local
+observation:
+  freshness-seconds: 30
