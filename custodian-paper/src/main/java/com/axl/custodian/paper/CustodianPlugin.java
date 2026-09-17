@@ -21,9 +21,10 @@ public final class CustodianPlugin extends JavaPlugin {
             saveDefaultConfig();
             var presence = new PresenceService(store, java.time.Clock.systemUTC(), java.time.Duration.ofSeconds(getConfig().getLong("observation.freshness-seconds", 30)));
             api = new IdentityService(store, java.time.Clock.systemUTC(), presence);
-            shadow = new PaperShadowContributor(store, presence, java.time.Clock.systemUTC());
+            String serverId = getConfig().getString("server-id", "local");
+            shadow = new PaperShadowContributor(store, presence, java.time.Clock.systemUTC(), serverId);
             observation = new PaperObservationAdapter(this, presence, com.axl.custodian.api.AuthorityHandle.issuedByHost("custodian-native"),
-                    getConfig().getString("server-id", "local"), java.time.Duration.ofSeconds(getConfig().getLong("observation.freshness-seconds", 30)), java.time.Clock.systemUTC());
+                    serverId, java.time.Duration.ofSeconds(getConfig().getLong("observation.freshness-seconds", 30)), java.time.Clock.systemUTC());
             getServer().getPluginManager().registerEvents(observation, this);
             PaperServiceRegistry.register(getServer().getServicesManager(), this, api, shadow);
         } catch (Exception failure) {

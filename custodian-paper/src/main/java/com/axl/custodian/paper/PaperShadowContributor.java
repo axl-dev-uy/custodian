@@ -24,24 +24,34 @@ final class PaperShadowContributor implements com.axl.custodian.api.ShadowContri
     private final PresenceService presences;
     private final ScopeContributor contributor;
     private final Clock clock;
+    private final String expectedServerId;
     private final Map<UUID, Session> handles = new HashMap<>();
     private boolean shutdown;
 
     PaperShadowContributor(CustodianStore store, PresenceService presences) {
-        this(store, presences, Clock.systemUTC());
+        this(store, presences, Clock.systemUTC(), null);
     }
 
     PaperShadowContributor(CustodianStore store, PresenceService presences, Clock clock) {
+        this(store, presences, clock, null);
+    }
+
+    PaperShadowContributor(
+            CustodianStore store, PresenceService presences, Clock clock, String expectedServerId) {
         this.store = Objects.requireNonNull(store, "store");
         this.presences = Objects.requireNonNull(presences, "presences");
         this.contributor = new ScopeContributor(presences);
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.expectedServerId = expectedServerId;
     }
 
     @Override
     public synchronized BridgeHandle startBridgeEpoch(AuthorityHandle authority, String serverId) {
         requireRunning();
         Objects.requireNonNull(authority, "authority");
+        if (expectedServerId != null && !expectedServerId.equals(serverId)) {
+            throw new IllegalArgumentException("Bridge server ID does not match this Custodian server");
+        }
         Instant now = clock.instant();
         ProcessEpoch epoch = new ProcessEpoch(UUID.randomUUID(), serverId, now, now);
         store.startBridge(authority.id(), epoch);

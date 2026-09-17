@@ -36,6 +36,21 @@ class PaperShadowContributorTest {
     Path directory;
 
     @Test
+    void serverIdMismatchIsRejectedBeforeCreatingAHandle() {
+        Path database = directory.resolve("server-mismatch.db");
+        try (var store = new SqliteCustodianStore(database)) {
+            MutableClock clock = new MutableClock(NOW);
+            PresenceService presences = new PresenceService(store, clock, Duration.ofSeconds(30));
+            PaperShadowContributor shadow = new PaperShadowContributor(
+                    store, presences, clock, "paper-alpha");
+
+            assertThrows(IllegalArgumentException.class, () -> shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), "paper-beta"));
+            assertEquals(0, activeBridgeCount(database, AUTHORITY));
+        }
+    }
+
+    @Test
     void partialContributionUsesOpaqueEpochAndPreservesNativePresence() {
         try (Fixture fixture = fixture("partial.db")) {
             UUID identity = UUID.randomUUID();
