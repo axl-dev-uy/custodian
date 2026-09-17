@@ -1,14 +1,18 @@
 package com.axl.custodian.paper;
 
-import com.axl.custodian.core.sqlite.SqliteCustodianStore;
-import com.axl.custodian.core.PresenceService;
-import com.axl.custodian.core.IdentityService;
+import com.axl.custodian.core.storage.sqlite.SqliteCustodianStore;
+import com.axl.custodian.core.presence.PresenceService;
+import com.axl.custodian.core.identity.IdentityService;
 import com.axl.custodian.api.CustodianApi;
+import com.axl.custodian.paper.observation.PaperObservationAdapter;
+import com.axl.custodian.paper.observation.PhysicalInventoryProvider;
+import com.axl.custodian.paper.services.PaperServiceRegistry;
+import com.axl.custodian.paper.shadow.PaperShadowContributor;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.plugin.Plugin;
 import java.nio.file.Files;
 
-/** Bootstrap only; Paper observation is intentionally deferred to the next slice. */
+/** Paper bootstrap that wires the SQLite authority, native observation, and published services. */
 public final class CustodianPlugin extends JavaPlugin {
     private SqliteCustodianStore store;
     private PaperObservationAdapter observation;
@@ -23,7 +27,7 @@ public final class CustodianPlugin extends JavaPlugin {
             api = new IdentityService(store, java.time.Clock.systemUTC(), presence);
             String serverId = getConfig().getString("server-id", "local");
             shadow = new PaperShadowContributor(store, presence, java.time.Clock.systemUTC(), serverId);
-            observation = new PaperObservationAdapter(this, presence, com.axl.custodian.api.AuthorityHandle.issuedByHost("custodian-native"),
+            observation = new PaperObservationAdapter(this, presence, com.axl.custodian.api.identity.AuthorityHandle.issuedByHost("custodian-native"),
                     serverId, java.time.Duration.ofSeconds(getConfig().getLong("observation.freshness-seconds", 30)), java.time.Clock.systemUTC());
             getServer().getPluginManager().registerEvents(observation, this);
             PaperServiceRegistry.register(getServer().getServicesManager(), this, api, shadow);

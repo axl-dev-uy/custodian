@@ -1,5 +1,12 @@
 package com.axl.custodian.api;
 
+import com.axl.custodian.api.identity.AuthorityHandle;
+import com.axl.custodian.api.identity.IdentityOrigin;
+import com.axl.custodian.api.identity.RegistrationResult;
+import com.axl.custodian.api.identity.ValidationResult;
+import com.axl.custodian.api.presence.ObservationResult;
+import com.axl.custodian.api.presence.PhysicalPresence;
+import com.axl.custodian.api.presence.ProcessEpoch;
 import java.util.UUID;
 
 /** Stable integration surface. It has no Paper, JDBC, repository, or mutable-item types. */

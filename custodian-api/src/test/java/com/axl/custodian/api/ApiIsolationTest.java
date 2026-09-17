@@ -5,16 +5,22 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
 class ApiIsolationTest {
-    @Test void adoptionAndValidationExposeNoPaperOrMutableItemTypes() {
-        assertNoBukkitTypes(CustodianApi.class);
-        assertNoBukkitTypes(ShadowContributor.class);
+    @Test void rootContractsExposeOnlyApiDomainTypes() {
+        assertOnlyApiTypes(CustodianApi.class);
+        assertOnlyApiTypes(ShadowContributor.class);
     }
-    private static void assertNoBukkitTypes(Class<?> contract) {
+    private static void assertOnlyApiTypes(Class<?> contract) {
         for (Method method : contract.getDeclaredMethods()) {
-            assertFalse(method.getReturnType().getName().startsWith("org.bukkit."));
+            assertApiType(method.getReturnType());
             for (Class<?> parameter : method.getParameterTypes()) {
-                assertFalse(parameter.getName().startsWith("org.bukkit."));
+                assertApiType(parameter);
             }
         }
+    }
+    private static void assertApiType(Class<?> type) {
+        String name = type.getName();
+        assertFalse(name.startsWith("org.bukkit."));
+        assertFalse(name.startsWith("com.axl.custodian.core."));
+        assertFalse(name.startsWith("com.axl.custodian.paper."));
     }
 }
