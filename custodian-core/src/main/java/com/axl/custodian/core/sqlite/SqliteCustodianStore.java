@@ -127,6 +127,60 @@ public final class SqliteCustodianStore implements CustodianStore {
             try { connection.setAutoCommit(true); } catch (SQLException failure) { throw new StorageException("Unable to restore SQLite transaction mode", failure); }
         }
     }
+    @Override public synchronized void mergeIdentitySnapshot(
+            ProcessEpoch epoch, UUID identity, Instant observedAt, List<PhysicalPresence> presences) {
+        if (findIdentity(identity).isEmpty()) throw new IllegalArgumentException("Cannot observe an unknown identity");
+        if (presences.stream().anyMatch(p -> !p.identity().equals(identity)
+                || !p.epoch().id().equals(epoch.id()) || !p.observedAt().equals(observedAt))) {
+            throw new IllegalArgumentException("Presence is outside identity snapshot");
+        }
+        if (!epochFresh(epoch.id(), epoch.heartbeatAt())) throw new IllegalArgumentException("Inactive process epoch");
+        try {
+            connection.setAutoCommit(false);
+            Instant latest = null;
+            try (PreparedStatement query = connection.prepareStatement(
+                    "SELECT observed_at FROM current_presence WHERE identity=? AND process_epoch=?")) {
+                query.setString(1, identity.toString()); query.setString(2, epoch.id().toString());
+                try (ResultSet result = query.executeQuery()) {
+                    while (result.next()) {
+                        Instant candidate = Instant.parse(result.getString(1));
+                        if (latest == null || candidate.isAfter(latest)) latest = candidate;
+                    }
+                }
+            }
+            if (latest != null && observedAt.isBefore(latest)) {
+                throw new IllegalArgumentException("Stale identity snapshot contribution");
+            }
+            if (latest != null && observedAt.isAfter(latest)) {
+                try (PreparedStatement delete = connection.prepareStatement(
+                        "DELETE FROM current_presence WHERE identity=? AND process_epoch=?")) {
+                    delete.setString(1, identity.toString()); delete.setString(2, epoch.id().toString());
+                    delete.executeUpdate();
+                }
+            }
+            try (PreparedStatement insert = connection.prepareStatement(
+                    "INSERT INTO current_presence(identity,server_id,process_epoch,physical_instance,location,observed_at) "
+                            + "VALUES(?,?,?,?,?,?) ON CONFLICT(identity,process_epoch,physical_instance) "
+                            + "DO UPDATE SET location=excluded.location,observed_at=excluded.observed_at")) {
+                for (PhysicalPresence presence : presences) {
+                    insert.setString(1, identity.toString()); insert.setString(2, epoch.serverId());
+                    insert.setString(3, epoch.id().toString()); insert.setString(4, presence.instance().id());
+                    insert.setString(5, presence.location()); insert.setString(6, observedAt.toString());
+                    insert.addBatch();
+                }
+                insert.executeBatch();
+            }
+            connection.commit();
+        } catch (IllegalArgumentException failure) {
+            rollback(failure);
+            throw failure;
+        } catch (SQLException failure) {
+            rollback(failure);
+            throw new StorageException("Unable to merge identity snapshot", failure);
+        } finally {
+            restoreAutoCommit();
+        }
+    }
     @Override public synchronized void reconcileScope(ProcessEpoch epoch, String scopeId, List<PhysicalPresence> presences) {
         if (presences.stream().anyMatch(p -> !p.epoch().id().equals(epoch.id()) || !p.instance().id().startsWith(scopeId + ":"))) throw new IllegalArgumentException("Presence is outside reconciliation scope");
         if (!epochFresh(epoch.id(), epoch.heartbeatAt())) throw new IllegalArgumentException("Inactive process epoch");
@@ -215,11 +269,17 @@ public final class SqliteCustodianStore implements CustodianStore {
             }
             try (PreparedStatement endPrevious = connection.prepareStatement(
                     "UPDATE bridge_epochs SET active=0 WHERE authority_id=? AND server_id=? AND active=1");
+                 PreparedStatement deletePreviousPresence = connection.prepareStatement(
+                         "DELETE FROM current_presence WHERE process_epoch IN "
+                                 + "(SELECT epoch_id FROM bridge_epochs WHERE authority_id=? AND server_id=? AND active=0)");
                  PreparedStatement insert = connection.prepareStatement(
                          "INSERT INTO bridge_epochs(epoch_id,authority_id,server_id,started_at,heartbeat_at,active) VALUES(?,?,?,?,?,1)")) {
                 endPrevious.setString(1, authorityId);
                 endPrevious.setString(2, epoch.serverId());
                 endPrevious.executeUpdate();
+                deletePreviousPresence.setString(1, authorityId);
+                deletePreviousPresence.setString(2, epoch.serverId());
+                deletePreviousPresence.executeUpdate();
                 insert.setString(1, epoch.id().toString());
                 insert.setString(2, authorityId);
                 insert.setString(3, epoch.serverId());
@@ -290,12 +350,23 @@ public final class SqliteCustodianStore implements CustodianStore {
     }
 
     @Override public synchronized void invalidateBridge(UUID epochId) {
-        try (PreparedStatement update = connection.prepareStatement(
-                "UPDATE bridge_epochs SET active=0 WHERE epoch_id=?")) {
-            update.setString(1, epochId.toString());
-            update.executeUpdate();
+        try {
+            connection.setAutoCommit(false);
+            try (PreparedStatement update = connection.prepareStatement(
+                    "UPDATE bridge_epochs SET active=0 WHERE epoch_id=?");
+                 PreparedStatement delete = connection.prepareStatement(
+                         "DELETE FROM current_presence WHERE process_epoch=?")) {
+                update.setString(1, epochId.toString());
+                update.executeUpdate();
+                delete.setString(1, epochId.toString());
+                delete.executeUpdate();
+            }
+            connection.commit();
         } catch (SQLException failure) {
+            rollback(failure);
             throw new StorageException("Unable to invalidate bridge", failure);
+        } finally {
+            restoreAutoCommit();
         }
     }
 
@@ -319,6 +390,9 @@ public final class SqliteCustodianStore implements CustodianStore {
         try {
             connection.setAutoCommit(false);
             try (PreparedStatement presenceDelete = connection.prepareStatement("DELETE FROM current_presence WHERE physical_instance LIKE ?");
+                 PreparedStatement bridgePresenceDelete = connection.prepareStatement(
+                         "DELETE FROM current_presence WHERE process_epoch IN "
+                                 + "(SELECT epoch_id FROM bridge_epochs WHERE authority_id=?)");
                  PreparedStatement scopeQuery = connection.prepareStatement("SELECT scope_id FROM scope_owners WHERE authority_id=?");
                  PreparedStatement scopeDelete = connection.prepareStatement("DELETE FROM scope_owners WHERE authority_id=?");
                  PreparedStatement bridgeInvalidate = connection.prepareStatement("UPDATE bridge_epochs SET active=0 WHERE authority_id=?")) {
@@ -330,6 +404,8 @@ public final class SqliteCustodianStore implements CustodianStore {
                     }
                 }
                 presenceDelete.executeBatch();
+                bridgePresenceDelete.setString(1, authorityId);
+                bridgePresenceDelete.executeUpdate();
                 scopeDelete.setString(1, authorityId);
                 scopeDelete.executeUpdate();
                 bridgeInvalidate.setString(1, authorityId);
@@ -344,7 +420,7 @@ public final class SqliteCustodianStore implements CustodianStore {
         }
     }
     @Override public synchronized List<PhysicalPresence> activePresences(UUID identity, Instant freshAfter) {
-        try (PreparedStatement q = connection.prepareStatement("SELECT p.server_id,p.process_epoch,p.physical_instance,p.location,p.observed_at,e.started_at,e.heartbeat_at FROM current_presence p JOIN process_epochs e ON e.epoch_id=p.process_epoch WHERE p.identity=? AND p.observed_at>=? AND e.heartbeat_at>=?")) {
+        try (PreparedStatement q = connection.prepareStatement("SELECT p.server_id,p.process_epoch,p.physical_instance,p.location,p.observed_at,e.started_at,e.heartbeat_at FROM current_presence p JOIN process_epochs e ON e.epoch_id=p.process_epoch LEFT JOIN bridge_epochs b ON b.epoch_id=p.process_epoch WHERE p.identity=? AND p.observed_at>=? AND e.heartbeat_at>=? AND (b.epoch_id IS NULL OR b.active=1)")) {
             q.setString(1, identity.toString()); q.setString(2, freshAfter.toString()); q.setString(3, freshAfter.toString()); try (ResultSet rs = q.executeQuery()) { List<PhysicalPresence> result = new ArrayList<>(); while (rs.next()) { ProcessEpoch epoch = new ProcessEpoch(UUID.fromString(rs.getString(2)), rs.getString(1), Instant.parse(rs.getString(6)), Instant.parse(rs.getString(7))); result.add(new PhysicalPresence(identity, epoch, new PhysicalInstance(rs.getString(3)), rs.getString(4), Instant.parse(rs.getString(5)))); } return List.copyOf(result); }
         } catch (SQLException failure) { throw new StorageException("Unable to list presence", failure); }
     }

@@ -8,4 +8,9 @@ public final class ScopeContributor {
   for(PhysicalPresence p:contribution.presences()) if(!p.epoch().id().equals(epoch.id())||!p.instance().id().startsWith(contribution.scope().id()+":")) throw new IllegalArgumentException("Contribution outside native scope");
   presences.reconcile(new PresenceReconciliation(epoch,contribution.scope().id(),ReconciliationMode.PARTIAL,contribution.presences()));
  }
+ /** PARTIAL bridge contribution whose timestamp groups scopes into one settled snapshot. */
+ public void contributeSnapshot(ProcessEpoch epoch, ScopeContribution contribution){
+  for(PhysicalPresence p:contribution.presences()) if(!p.epoch().id().equals(epoch.id())||!p.instance().id().startsWith(contribution.scope().id()+":")) throw new IllegalArgumentException("Contribution outside native scope");
+  presences.contributeSnapshot(epoch,contribution.scope().id(),contribution.presences());
+ }
 }

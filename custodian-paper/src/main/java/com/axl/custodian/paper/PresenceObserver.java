@@ -14,6 +14,7 @@ import java.util.Set;
 import java.util.LinkedHashSet;
 import java.util.UUID;
 import org.bukkit.Location;
+import org.bukkit.block.BlockState;
 import org.bukkit.block.DoubleChest;
 import org.bukkit.entity.ChestedHorse;
 import org.bukkit.entity.Entity;
@@ -66,21 +67,24 @@ final class PresenceObserver {
         }
         InventoryHolder holder = inventory.getHolder();
         if (holder instanceof Player player) return new Scope("player:" + player.getUniqueId() + (inventory.equals(player.getEnderChest()) ? ":ender" : ":inventory"), "player:" + player.getUniqueId(), false);
-        Location inventoryLocation = inventory.getLocation();
-        if (inventoryLocation != null && nativeBlockType(inventory.getType())) { String location = location(inventoryLocation); return new Scope("block:" + location, location, false); }
         if (holder instanceof DoubleChest chest) {
             String left = blockLocation(chest.getLeftSide()), right = blockLocation(chest.getRightSide());
             if (left == null || right == null) return null;
             String first = left.compareTo(right) <= 0 ? left : right, second = left.compareTo(right) <= 0 ? right : left;
             return new Scope("double-block:" + first + ":" + second, first + ":" + second, false);
         }
+        Location inventoryLocation = inventory.getLocation();
+        if (inventoryLocation != null && nativeBlockType(inventory.getType())) { String location = location(inventoryLocation); return new Scope("block:" + location, location, false); }
         if (holder instanceof Entity entity && (entity instanceof StorageMinecart || entity instanceof HopperMinecart || entity instanceof ChestedHorse)) return new Scope("entity:" + entity.getUniqueId(), location(entity.getLocation()), false);
         return null;
     }
     private static String location(Location location) { return location.getWorld() == null ? "unknown" : location.getWorld().getUID() + ":" + location.getBlockX() + ":" + location.getBlockY() + ":" + location.getBlockZ(); }
     private static String blockLocation(InventoryHolder holder) {
-        if (holder == null || holder.getInventory().getLocation() == null) return null;
-        return location(holder.getInventory().getLocation());
+        if (!(holder instanceof BlockState blockState)
+                || blockState.getWorld() == null || blockState.getLocation() == null) return null;
+        Location location = blockState.getLocation();
+        return blockState.getWorld().getUID() + ":" + location.getBlockX() + ":"
+                + location.getBlockY() + ":" + location.getBlockZ();
     }
     private static boolean nativeBlockType(InventoryType type) {
         return type == InventoryType.CHEST || type == InventoryType.DISPENSER || type == InventoryType.DROPPER

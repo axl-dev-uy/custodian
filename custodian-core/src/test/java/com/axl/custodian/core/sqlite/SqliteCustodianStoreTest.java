@@ -50,4 +50,29 @@ class SqliteCustodianStoreTest {
             assertEquals(List.of(old), store.activePresences(known, now.minusSeconds(1)).stream().map(PhysicalPresence::instance).toList());
         }
     }
+    @Test void newerIdentitySnapshotSupersedesOldInstancesWhileEqualTimeContributionsAccumulate() {
+        UUID identity = UUID.randomUUID(); Instant first = Instant.parse("2026-01-01T00:00:30Z");
+        Instant second = first.plusSeconds(1); ProcessEpoch epoch = new ProcessEpoch(UUID.randomUUID(), "alpha", first, second);
+        try (var store = new SqliteCustodianStore(directory.resolve("identity-snapshot.db"))) {
+            store.adopt(identity, "infinitygear", first); store.startEpoch(epoch);
+            PhysicalPresence inventory = presence(identity, epoch, "player:alice:inventory:slot:0", first);
+            PhysicalPresence drop = presence(identity, epoch, "drop:item:one", second);
+            PhysicalPresence chest = presence(identity, epoch, "block:chest:slot:0", second);
+
+            store.mergeIdentitySnapshot(epoch, identity, first, List.of(inventory));
+            store.mergeIdentitySnapshot(epoch, identity, second, List.of(drop));
+            store.mergeIdentitySnapshot(epoch, identity, second, List.of(chest));
+            store.mergeIdentitySnapshot(epoch, identity, second, List.of(drop));
+
+            assertEquals(List.of("block:chest:slot:0", "drop:item:one"), store.activePresences(identity, first)
+                    .stream().map(p -> p.instance().id()).sorted().toList());
+            assertThrows(IllegalArgumentException.class,
+                    () -> store.mergeIdentitySnapshot(epoch, identity, first, List.of(inventory)));
+            assertEquals(2, store.activePresences(identity, first).size());
+        }
+    }
+    private static PhysicalPresence presence(
+            UUID identity, ProcessEpoch epoch, String instance, Instant observedAt) {
+        return new PhysicalPresence(identity, epoch, new PhysicalInstance(instance), instance, observedAt);
+    }
 }

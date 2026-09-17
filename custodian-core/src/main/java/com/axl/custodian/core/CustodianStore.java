@@ -18,6 +18,13 @@ public interface CustodianStore extends AutoCloseable {
     void replacePresence(PhysicalPresence presence);
     void closePresence(UUID identity, UUID epochId, PhysicalInstance instance);
     void movePresence(PhysicalPresence presence, PhysicalInstance previous);
+    /**
+     * Adds one partial scope contribution to an identity snapshot. A newer observation time
+     * atomically retires only older rows for the same epoch and identity; equal-time additions
+     * remain distinct members of the same snapshot generation.
+     */
+    void mergeIdentitySnapshot(ProcessEpoch epoch, UUID identity, Instant observedAt,
+                               List<PhysicalPresence> presences);
     void reconcileScope(ProcessEpoch epoch, String scopeId, List<PhysicalPresence> presences);
     boolean epochFresh(UUID epochId, Instant freshAfter);
     void registerScope(String authorityId, String scopeId);

@@ -32,13 +32,20 @@ public final class PresenceService {
     }
     public void reconcile(com.axl.custodian.api.PresenceReconciliation request) {
         if (!store.epochFresh(request.epoch().id(), clock.instant().minus(freshness))) throw new IllegalArgumentException("Inactive or stale process epoch");
-        var seen = new java.util.HashSet<String>();
-        for (PhysicalPresence p : request.presences()) {
-            if (!p.epoch().id().equals(request.epoch().id()) || !p.instance().id().startsWith(request.ownerScope() + ":")) throw new IllegalArgumentException("Presence is outside owner scope");
-            if (!seen.add(p.identity() + "\u0000" + p.instance().id())) throw new IllegalArgumentException("Duplicate identity/instance presence");
-        }
+        validate(request.epoch(), request.ownerScope(), request.presences());
         if (request.mode() == com.axl.custodian.api.ReconciliationMode.PARTIAL) { for (PhysicalPresence p : request.presences()) store.replacePresence(p); return; }
         store.reconcileScope(request.epoch(), request.ownerScope(), request.presences());
+    }
+    /** Merges one scope's PARTIAL observations into a timestamped bridge snapshot generation. */
+    public void contributeSnapshot(ProcessEpoch epoch, String scopeId, List<PhysicalPresence> presences) {
+        if (!store.epochFresh(epoch.id(), clock.instant().minus(freshness))) throw new IllegalArgumentException("Inactive or stale process epoch");
+        validate(epoch, scopeId, presences);
+        if (presences.isEmpty()) return;
+        UUID identity = presences.get(0).identity(); Instant observedAt = presences.get(0).observedAt();
+        if (presences.stream().anyMatch(p -> !p.identity().equals(identity) || !p.observedAt().equals(observedAt))) {
+            throw new IllegalArgumentException("Snapshot contribution must use one identity and observation time");
+        }
+        store.mergeIdentitySnapshot(epoch, identity, observedAt, presences);
     }
     /** Replaces a known previous physical instance during a settled movement, preventing a false duplicate. */
     public void move(PhysicalPresence presence, PhysicalInstance previous) {
@@ -49,5 +56,12 @@ public final class PresenceService {
         long distinct = active.stream().map(p -> p.epoch().serverId() + ":" + p.instance().id()).distinct().count();
         return new DuplicateAssessment(distinct == 0 ? DuplicateAssessment.Status.NONE : distinct == 1
                 ? DuplicateAssessment.Status.ONE_ACTIVE : DuplicateAssessment.Status.CONFIRMED_DISTINCT_ACTIVE, active);
+    }
+    private static void validate(ProcessEpoch epoch, String scopeId, List<PhysicalPresence> presences) {
+        var seen = new java.util.HashSet<String>();
+        for (PhysicalPresence p : presences) {
+            if (!p.epoch().id().equals(epoch.id()) || !p.instance().id().startsWith(scopeId + ":")) throw new IllegalArgumentException("Presence is outside owner scope");
+            if (!seen.add(p.identity() + "\u0000" + p.instance().id())) throw new IllegalArgumentException("Duplicate identity/instance presence");
+        }
     }
 }

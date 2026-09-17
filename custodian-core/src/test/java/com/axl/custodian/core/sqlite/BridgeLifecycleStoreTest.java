@@ -74,13 +74,19 @@ class BridgeLifecycleStoreTest {
     void newerEpochEndsTheOldEpochAndEndedEpochRejectsHeartbeats() {
         ProcessEpoch oldEpoch = epoch(STARTED_AT);
         ProcessEpoch newEpoch = epoch(STARTED_AT.plusSeconds(10));
+        UUID identity = UUID.randomUUID();
 
         try (var store = new SqliteCustodianStore(directory.resolve("superseded.db"))) {
+            store.adopt(identity, AUTHORITY, STARTED_AT);
             store.startBridge(AUTHORITY, oldEpoch);
+            store.replacePresence(new PhysicalPresence(identity, oldEpoch,
+                    new PhysicalInstance("entity:minecart:slot:0"), "minecart", STARTED_AT));
             store.startBridge(AUTHORITY, newEpoch);
 
             assertFalse(store.bridge(oldEpoch.id()).orElseThrow().active());
             assertTrue(store.bridge(newEpoch.id()).orElseThrow().active());
+            assertTrue(store.activePresences(identity, STARTED_AT).isEmpty(),
+                    "superseding a bridge must retire its fresh presences immediately");
             assertThrows(IllegalArgumentException.class,
                     () -> store.heartbeatBridge(oldEpoch.id(), STARTED_AT.plusSeconds(20)));
             ProcessEpoch staleEpoch = epoch(STARTED_AT.plusSeconds(5));
@@ -88,8 +94,13 @@ class BridgeLifecycleStoreTest {
             assertTrue(store.bridge(staleEpoch.id()).isEmpty());
             assertTrue(store.epochOwner(staleEpoch.id()).isEmpty());
 
+            store.replacePresence(new PhysicalPresence(identity, newEpoch,
+                    new PhysicalInstance("player:alice:inventory:slot:0"), "inventory", STARTED_AT.plusSeconds(10)));
+            store.invalidateBridge(newEpoch.id());
             store.invalidateBridge(newEpoch.id());
             assertFalse(store.bridge(newEpoch.id()).orElseThrow().active());
+            assertTrue(store.activePresences(identity, STARTED_AT).isEmpty(),
+                    "invalidation must retire bridge presences idempotently");
             assertThrows(IllegalArgumentException.class,
                     () -> store.heartbeatBridge(newEpoch.id(), STARTED_AT.plusSeconds(20)));
             assertThrows(IllegalArgumentException.class,

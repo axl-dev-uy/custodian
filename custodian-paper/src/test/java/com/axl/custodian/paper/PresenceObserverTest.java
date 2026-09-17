@@ -13,6 +13,7 @@ import java.util.UUID;
 import org.bukkit.Location;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
+import org.bukkit.block.Container;
 import org.bukkit.block.DoubleChest;
 import org.bukkit.entity.ChestedHorse;
 import org.bukkit.entity.Item;
@@ -39,10 +40,14 @@ class PresenceObserverTest {
         UUID id = UUID.randomUUID(); Fixture fixture = fixture(id); Player player = mock(Player.class); Inventory playerInventory = inventory(player, item(id));
         fixture.observer.scan(playerInventory); fixture.observer.scan(playerInventory);
         assertEquals(1, fixture.store.activePresences(id, NOW.minusSeconds(1)).size());
-        DoubleChest chest = mock(DoubleChest.class); InventoryHolder left = blockSide(1), right = blockSide(2); when(chest.getLeftSide()).thenReturn(left); when(chest.getRightSide()).thenReturn(right); Inventory chestInventory = inventory(chest, item(id));
+        DoubleChest chest = mock(DoubleChest.class); Inventory combined = mock(Inventory.class); Location combinedLocation = location(); when(combined.getLocation()).thenReturn(combinedLocation);
+        InventoryHolder left = blockSide(1, combined), right = blockSide(2, combined); when(chest.getLeftSide()).thenReturn(left); when(chest.getRightSide()).thenReturn(right); Inventory chestInventory = inventory(chest, item(id)); Location chestLocation = location(); when(chestInventory.getLocation()).thenReturn(chestLocation);
         fixture.observer.scan(chestInventory); fixture.observer.scan(chestInventory);
         var active = fixture.store.activePresences(id, NOW.minusSeconds(1));
         assertEquals(2, active.size()); assertEquals(2, active.stream().map(p -> p.instance().id()).distinct().count());
+        assertTrue(active.stream().map(p -> p.instance().id()).anyMatch(idValue -> idValue.equals(
+                "double-block:00000000-0000-0000-0000-000000000001:1:64:1:"
+                        + "00000000-0000-0000-0000-000000000001:2:64:1:slot:0")));
         fixture.close();
     }
     @Test void entityAndDropScopesAreStableAndDropCleanupIsIdempotent() {
@@ -88,9 +93,11 @@ class PresenceObserverTest {
         when(location.getBlockX()).thenReturn(1); when(location.getBlockY()).thenReturn(64); when(location.getBlockZ()).thenReturn(1);
         return location;
     }
-    private static InventoryHolder blockSide(int x) {
-        InventoryHolder holder = mock(InventoryHolder.class); Inventory inventory = mock(Inventory.class); Location location = location();
-        when(location.getBlockX()).thenReturn(x); when(inventory.getLocation()).thenReturn(location); when(holder.getInventory()).thenReturn(inventory); return holder;
+    private static InventoryHolder blockSide(int x, Inventory combinedInventory) {
+        Container holder = mock(Container.class); Location location = location(); World world = location.getWorld();
+        when(location.getBlockX()).thenReturn(x); when(holder.getLocation()).thenReturn(location);
+        when(holder.getWorld()).thenReturn(world); when(holder.getInventory()).thenReturn(combinedInventory);
+        return holder;
     }
     private record Fixture(SqliteCustodianStore store, PresenceObserver observer) { void close() { store.close(); } }
 }

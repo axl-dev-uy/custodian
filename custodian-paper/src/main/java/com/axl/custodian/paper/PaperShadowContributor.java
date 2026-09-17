@@ -13,6 +13,7 @@ import com.axl.custodian.core.ScopeContributor;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -74,7 +75,14 @@ final class PaperShadowContributor implements com.axl.custodian.api.ShadowContri
         List<PhysicalPresence> translated = contribution.presences().stream()
                 .map(presence -> translate(handle, session.epoch(), presence))
                 .toList();
-        contributor.contribute(session.epoch(), new ScopeContribution(contribution.scope(), translated));
+        Map<UUID, List<PhysicalPresence>> byIdentity = new LinkedHashMap<>();
+        for (PhysicalPresence presence : translated) {
+            byIdentity.computeIfAbsent(presence.identity(), ignored -> new java.util.ArrayList<>()).add(presence);
+        }
+        for (List<PhysicalPresence> identityPresences : byIdentity.values()) {
+            contributor.contributeSnapshot(session.epoch(),
+                    new ScopeContribution(contribution.scope(), identityPresences));
+        }
 
         if (translated.isEmpty()) {
             return new DuplicateAssessment(DuplicateAssessment.Status.NONE, List.of());

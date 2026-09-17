@@ -72,6 +72,54 @@ class PaperShadowContributorTest {
     }
 
     @Test
+    void newerSettledSnapshotRetiresOnlyOldBridgePresenceAndPreservesNativeObservation() {
+        try (Fixture fixture = fixture("settled-movement.db")) {
+            UUID identity = UUID.randomUUID();
+            fixture.store.adopt(identity, AUTHORITY, NOW);
+            BridgeHandle handle = fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+            fixture.shadow.contribute(handle, contribution(
+                    handle, identity, "player:alice:inventory", "player:alice:inventory:slot:0", NOW));
+
+            Instant movedAt = NOW.plusSeconds(1);
+            fixture.clock.advance(Duration.ofSeconds(1));
+            ProcessEpoch nativeEpoch = new ProcessEpoch(UUID.randomUUID(), SERVER, NOW, movedAt);
+            fixture.store.startEpoch(nativeEpoch);
+            fixture.store.replacePresence(new PhysicalPresence(identity, nativeEpoch,
+                    new PhysicalInstance("drop:item-one:item"), "drop", movedAt));
+            DuplicateAssessment assessment = fixture.shadow.contribute(handle, contribution(
+                    handle, identity, "drop:item-one", "drop:item-one:item", movedAt));
+
+            assertEquals(DuplicateAssessment.Status.ONE_ACTIVE, assessment.status());
+            List<PhysicalPresence> active = fixture.store.activePresences(identity, NOW.minusSeconds(1));
+            assertEquals(2, active.size(), "native and bridge rows for one physical instance are retained");
+            assertTrue(active.stream().allMatch(p -> p.instance().id().equals("drop:item-one:item")));
+        }
+    }
+
+    @Test
+    void equalTimeScopesStillConfirmRealDuplicateAndRetriesAreIdempotent() {
+        try (Fixture fixture = fixture("same-snapshot-duplicate.db")) {
+            UUID identity = UUID.randomUUID();
+            fixture.store.adopt(identity, AUTHORITY, NOW);
+            BridgeHandle handle = fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+            ScopeContribution inventory = contribution(
+                    handle, identity, "player:alice:inventory", "player:alice:inventory:slot:0", NOW);
+            ScopeContribution ender = contribution(
+                    handle, identity, "player:alice:ender", "player:alice:ender:slot:0", NOW);
+
+            fixture.shadow.contribute(handle, inventory);
+            DuplicateAssessment duplicate = fixture.shadow.contribute(handle, ender);
+            DuplicateAssessment retry = fixture.shadow.contribute(handle, ender);
+
+            assertEquals(DuplicateAssessment.Status.CONFIRMED_DISTINCT_ACTIVE, duplicate.status());
+            assertEquals(DuplicateAssessment.Status.CONFIRMED_DISTINCT_ACTIVE, retry.status());
+            assertEquals(2, fixture.store.activePresences(identity, NOW.minusSeconds(1)).size());
+        }
+    }
+
+    @Test
     void forgedForeignAndWrongEpochHandlesFailBeforeWriting() {
         try (Fixture fixture = fixture("forged.db")) {
             UUID identity = UUID.randomUUID();
@@ -111,6 +159,36 @@ class PaperShadowContributorTest {
     }
 
     @Test
+    void restartedServiceSupersedesFreshPersistedPresenceBeforeMovementAssessment() {
+        try (Fixture fixture = fixture("restart-movement.db")) {
+            UUID identity = UUID.randomUUID();
+            fixture.store.adopt(identity, AUTHORITY, NOW);
+            BridgeHandle oldHandle = fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+            fixture.shadow.contribute(oldHandle, contribution(
+                    oldHandle, identity, "entity:minecart", "entity:minecart:slot:0", NOW));
+
+            fixture.clock.advance(Duration.ofSeconds(1));
+            PresenceService restartedPresences = new PresenceService(
+                    fixture.store, fixture.clock, Duration.ofSeconds(30));
+            PaperShadowContributor restarted = new PaperShadowContributor(
+                    fixture.store, restartedPresences, fixture.clock);
+            BridgeHandle newHandle = restarted.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+            DuplicateAssessment moved = restarted.contribute(newHandle, contribution(
+                    newHandle, identity, "player:alice:inventory",
+                    "player:alice:inventory:slot:0", NOW.plusSeconds(1)));
+
+            assertEquals(DuplicateAssessment.Status.ONE_ACTIVE, moved.status());
+            assertEquals(List.of("player:alice:inventory:slot:0"),
+                    fixture.store.activePresences(identity, NOW.minusSeconds(1)).stream()
+                            .map(p -> p.instance().id()).toList());
+            assertThrows(IllegalArgumentException.class, () -> fixture.shadow.heartbeat(oldHandle));
+            restarted.shutdown();
+        }
+    }
+
+    @Test
     void releasedBridgeRejectsHeartbeatAndContribution() {
         try (Fixture fixture = fixture("ended.db")) {
             BridgeHandle handle = fixture.shadow.startBridgeEpoch(
@@ -128,8 +206,11 @@ class PaperShadowContributorTest {
     @Test
     void shutdownInvalidatesPersistedEpochsAndAllInMemoryHandles() {
         try (Fixture fixture = fixture("shutdown.db")) {
+            UUID identity = UUID.randomUUID();
+            fixture.store.adopt(identity, AUTHORITY, NOW);
             BridgeHandle handle = fixture.shadow.startBridgeEpoch(
                     AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+            fixture.shadow.contribute(handle, contribution(handle, identity, SCOPE + ":slot:0"));
 
             fixture.shadow.shutdown();
             fixture.shadow.shutdown();
@@ -138,6 +219,7 @@ class PaperShadowContributorTest {
             assertThrows(IllegalStateException.class, () -> fixture.shadow.startBridgeEpoch(
                     AuthorityHandle.issuedByHost(AUTHORITY), SERVER));
             assertEquals(0, activeBridgeCount(fixture.database, AUTHORITY));
+            assertTrue(fixture.store.activePresences(identity, NOW.minusSeconds(1)).isEmpty());
         }
     }
 
@@ -151,9 +233,14 @@ class PaperShadowContributorTest {
 
     private static ScopeContribution contribution(
             BridgeHandle handle, UUID identity, String physicalInstance) {
-        ProcessEpoch publicEpoch = new ProcessEpoch(handle.epochId(), "opaque", NOW, NOW);
-        return new ScopeContribution(new ScannerScope(SCOPE), List.of(new PhysicalPresence(
-                identity, publicEpoch, new PhysicalInstance(physicalInstance), "shadow slot", NOW)));
+        return contribution(handle, identity, SCOPE, physicalInstance, NOW);
+    }
+
+    private static ScopeContribution contribution(
+            BridgeHandle handle, UUID identity, String scope, String physicalInstance, Instant observedAt) {
+        ProcessEpoch publicEpoch = new ProcessEpoch(handle.epochId(), "opaque", observedAt, observedAt);
+        return new ScopeContribution(new ScannerScope(scope), List.of(new PhysicalPresence(
+                identity, publicEpoch, new PhysicalInstance(physicalInstance), "shadow slot", observedAt)));
     }
 
     private static int activeBridgeCount(Path database, String authority) {
