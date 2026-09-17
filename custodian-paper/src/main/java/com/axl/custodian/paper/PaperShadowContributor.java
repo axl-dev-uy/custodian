@@ -1,12 +1,112 @@
 package com.axl.custodian.paper;
-import com.axl.custodian.api.*; import com.axl.custodian.core.*; import java.time.*; import java.util.*;
+
+import com.axl.custodian.api.AuthorityHandle;
+import com.axl.custodian.api.BridgeHandle;
+import com.axl.custodian.api.DuplicateAssessment;
+import com.axl.custodian.api.PhysicalPresence;
+import com.axl.custodian.api.ProcessEpoch;
+import com.axl.custodian.api.ScopeContribution;
+import com.axl.custodian.core.BridgeLifecycle;
+import com.axl.custodian.core.CustodianStore;
+import com.axl.custodian.core.PresenceService;
+import com.axl.custodian.core.ScopeContributor;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+
 /** Paper service; handles are in-memory capabilities backed by persisted bridge epoch state. */
-final class PaperShadowContributor implements ShadowContributor {
- private final CustodianStore store; private final PresenceService presences; private final Map<UUID,ProcessEpoch> handles=new HashMap<>();
- PaperShadowContributor(CustodianStore store,PresenceService presences){this.store=store;this.presences=presences;}
- public synchronized BridgeHandle startBridgeEpoch(AuthorityHandle authority,String server){ProcessEpoch e=new ProcessEpoch(UUID.randomUUID(),server,Instant.now(),Instant.now());store.startBridge(authority.id(),e);store.bindEpoch(authority.id(),e);UUID token=UUID.randomUUID();handles.put(token,e);return new BridgeHandle(token,authority.id());}
- public synchronized void heartbeat(BridgeHandle h){ProcessEpoch e=require(h);store.heartbeatBridge(e.id(),Instant.now());store.heartbeat(e.id(),Instant.now());}
- public synchronized DuplicateAssessment contribute(BridgeHandle h,ScopeContribution c){ProcessEpoch e=require(h);var b=store.bridge(e.id()).orElseThrow(()->new IllegalArgumentException("Unknown bridge"));if(!b.active())throw new IllegalArgumentException("Inactive bridge");new ScopeContributor(presences).contribute(e,c);UUID id=c.presences().isEmpty()?null:c.presences().get(0).identity();return id==null?new DuplicateAssessment(DuplicateAssessment.Status.NONE,List.of()):presences.assess(id);}
- synchronized void shutdown(){for(ProcessEpoch e:handles.values())store.invalidateBridge(e.id());handles.clear();}
- private ProcessEpoch require(BridgeHandle h){ProcessEpoch e=handles.get(h.epochId());if(e==null||!h.contributorId().equals(store.bridge(e.id()).map(BridgeLifecycle::authorityId).orElse(null)))throw new IllegalArgumentException("Invalid bridge handle");return e;}
+final class PaperShadowContributor implements com.axl.custodian.api.ShadowContributor {
+    private final CustodianStore store;
+    private final PresenceService presences;
+    private final ScopeContributor contributor;
+    private final Clock clock;
+    private final Map<UUID, Session> handles = new HashMap<>();
+    private boolean shutdown;
+
+    PaperShadowContributor(CustodianStore store, PresenceService presences) {
+        this(store, presences, Clock.systemUTC());
+    }
+
+    PaperShadowContributor(CustodianStore store, PresenceService presences, Clock clock) {
+        this.store = Objects.requireNonNull(store, "store");
+        this.presences = Objects.requireNonNull(presences, "presences");
+        this.contributor = new ScopeContributor(presences);
+        this.clock = Objects.requireNonNull(clock, "clock");
+    }
+
+    @Override
+    public synchronized BridgeHandle startBridgeEpoch(AuthorityHandle authority, String serverId) {
+        requireRunning();
+        Objects.requireNonNull(authority, "authority");
+        Instant now = clock.instant();
+        ProcessEpoch epoch = new ProcessEpoch(UUID.randomUUID(), serverId, now, now);
+        store.startBridge(authority.id(), epoch);
+
+        UUID token = UUID.randomUUID();
+        handles.put(token, new Session(authority.id(), epoch));
+        return new BridgeHandle(token, authority.id());
+    }
+
+    @Override
+    public synchronized void heartbeat(BridgeHandle handle) {
+        Session session = require(handle);
+        store.heartbeatBridge(session.epoch().id(), clock.instant());
+    }
+
+    @Override
+    public synchronized DuplicateAssessment contribute(BridgeHandle handle, ScopeContribution contribution) {
+        Session session = require(handle);
+        Objects.requireNonNull(contribution, "contribution");
+        List<PhysicalPresence> translated = contribution.presences().stream()
+                .map(presence -> translate(handle, session.epoch(), presence))
+                .toList();
+        contributor.contribute(session.epoch(), new ScopeContribution(contribution.scope(), translated));
+
+        if (translated.isEmpty()) {
+            return new DuplicateAssessment(DuplicateAssessment.Status.NONE, List.of());
+        }
+        return presences.assess(translated.get(0).identity());
+    }
+
+    synchronized void shutdown() {
+        if (shutdown) return;
+        shutdown = true;
+        for (Session session : handles.values()) store.invalidateBridge(session.epoch().id());
+        handles.clear();
+    }
+
+    private Session require(BridgeHandle handle) {
+        requireRunning();
+        Objects.requireNonNull(handle, "handle");
+        Session session = handles.get(handle.epochId());
+        if (session == null || !session.authorityId().equals(handle.contributorId())) {
+            throw new IllegalArgumentException("Invalid bridge handle");
+        }
+        BridgeLifecycle lifecycle = store.bridge(session.epoch().id())
+                .orElseThrow(() -> new IllegalArgumentException("Unknown bridge epoch"));
+        boolean correctlyBound = lifecycle.active()
+                && session.authorityId().equals(lifecycle.authorityId())
+                && store.epochOwner(session.epoch().id()).filter(session.authorityId()::equals).isPresent();
+        if (!correctlyBound) throw new IllegalArgumentException("Inactive or foreign bridge epoch");
+        return session;
+    }
+
+    private static PhysicalPresence translate(
+            BridgeHandle handle, ProcessEpoch persistedEpoch, PhysicalPresence presence) {
+        if (!presence.epoch().id().equals(handle.epochId())) {
+            throw new IllegalArgumentException("Contribution does not use its bridge handle epoch");
+        }
+        return new PhysicalPresence(presence.identity(), persistedEpoch, presence.instance(),
+                presence.location(), presence.observedAt());
+    }
+
+    private void requireRunning() {
+        if (shutdown) throw new IllegalStateException("Shadow contributor is shut down");
+    }
+
+    private record Session(String authorityId, ProcessEpoch epoch) { }
 }

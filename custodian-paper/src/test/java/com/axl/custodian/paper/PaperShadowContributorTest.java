@@ -1,0 +1,176 @@
+package com.axl.custodian.paper;
+
+import com.axl.custodian.api.AuthorityHandle;
+import com.axl.custodian.api.BridgeHandle;
+import com.axl.custodian.api.DuplicateAssessment;
+import com.axl.custodian.api.PhysicalInstance;
+import com.axl.custodian.api.PhysicalPresence;
+import com.axl.custodian.api.ProcessEpoch;
+import com.axl.custodian.api.ScannerScope;
+import com.axl.custodian.api.ScopeContribution;
+import com.axl.custodian.core.PresenceService;
+import com.axl.custodian.core.sqlite.SqliteCustodianStore;
+import java.nio.file.Path;
+import java.sql.DriverManager;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.UUID;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class PaperShadowContributorTest {
+    private static final String AUTHORITY = "infinitygear";
+    private static final String SERVER = "paper-alpha";
+    private static final String SCOPE = "native:player:alice";
+    private static final Instant NOW = Instant.parse("2026-09-17T15:00:00Z");
+
+    @TempDir
+    Path directory;
+
+    @Test
+    void partialContributionUsesOpaqueEpochAndPreservesNativePresence() {
+        try (Fixture fixture = fixture("partial.db")) {
+            UUID identity = UUID.randomUUID();
+            fixture.store.adopt(identity, AUTHORITY, NOW);
+            ProcessEpoch nativeEpoch = new ProcessEpoch(UUID.randomUUID(), SERVER, NOW, NOW);
+            fixture.store.startEpoch(nativeEpoch);
+            fixture.store.replacePresence(new PhysicalPresence(identity, nativeEpoch,
+                    new PhysicalInstance(SCOPE + ":slot:0"), "native slot 0", NOW));
+
+            BridgeHandle handle = fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+            assertTrue(fixture.store.bridge(handle.epochId()).isEmpty(), "public handle UUID must be opaque");
+            DuplicateAssessment assessment = fixture.shadow.contribute(handle,
+                    contribution(handle, identity, SCOPE + ":slot:1"));
+
+            assertEquals(DuplicateAssessment.Status.CONFIRMED_DISTINCT_ACTIVE, assessment.status());
+            assertEquals(2, fixture.store.activePresences(identity, NOW.minusSeconds(1)).size());
+        }
+    }
+
+    @Test
+    void forgedForeignAndWrongEpochHandlesFailBeforeWriting() {
+        try (Fixture fixture = fixture("forged.db")) {
+            UUID identity = UUID.randomUUID();
+            fixture.store.adopt(identity, AUTHORITY, NOW);
+            BridgeHandle valid = fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+            BridgeHandle forged = new BridgeHandle(UUID.randomUUID(), AUTHORITY);
+            BridgeHandle foreign = new BridgeHandle(valid.epochId(), "other");
+
+            assertThrows(IllegalArgumentException.class,
+                    () -> fixture.shadow.contribute(forged, contribution(forged, identity, SCOPE + ":slot:0")));
+            assertThrows(IllegalArgumentException.class, () -> fixture.shadow.heartbeat(foreign));
+            ScopeContribution wrongEpoch = contribution(
+                    new BridgeHandle(UUID.randomUUID(), AUTHORITY), identity, SCOPE + ":slot:0");
+            assertThrows(IllegalArgumentException.class,
+                    () -> fixture.shadow.contribute(valid, wrongEpoch));
+            assertTrue(fixture.store.activePresences(identity, NOW.minusSeconds(1)).isEmpty());
+        }
+    }
+
+    @Test
+    void supersededHandleIsStaleWhileReplacementRemainsUsable() {
+        try (Fixture fixture = fixture("stale.db")) {
+            BridgeHandle stale = fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+            fixture.clock.advance(Duration.ofSeconds(1));
+            BridgeHandle replacement = fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+
+            assertThrows(IllegalArgumentException.class, () -> fixture.shadow.heartbeat(stale));
+            assertThrows(IllegalArgumentException.class,
+                    () -> fixture.shadow.contribute(stale,
+                            new ScopeContribution(new ScannerScope(SCOPE), List.of())));
+            fixture.shadow.heartbeat(replacement);
+            assertEquals(1, activeBridgeCount(fixture.database, AUTHORITY));
+        }
+    }
+
+    @Test
+    void releasedBridgeRejectsHeartbeatAndContribution() {
+        try (Fixture fixture = fixture("ended.db")) {
+            BridgeHandle handle = fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+            fixture.store.releaseAuthority(AUTHORITY);
+
+            assertThrows(IllegalArgumentException.class, () -> fixture.shadow.heartbeat(handle));
+            assertThrows(IllegalArgumentException.class,
+                    () -> fixture.shadow.contribute(handle,
+                            new ScopeContribution(new ScannerScope(SCOPE), List.of())));
+            assertEquals(0, activeBridgeCount(fixture.database, AUTHORITY));
+        }
+    }
+
+    @Test
+    void shutdownInvalidatesPersistedEpochsAndAllInMemoryHandles() {
+        try (Fixture fixture = fixture("shutdown.db")) {
+            BridgeHandle handle = fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER);
+
+            fixture.shadow.shutdown();
+            fixture.shadow.shutdown();
+
+            assertThrows(IllegalStateException.class, () -> fixture.shadow.heartbeat(handle));
+            assertThrows(IllegalStateException.class, () -> fixture.shadow.startBridgeEpoch(
+                    AuthorityHandle.issuedByHost(AUTHORITY), SERVER));
+            assertEquals(0, activeBridgeCount(fixture.database, AUTHORITY));
+        }
+    }
+
+    private Fixture fixture(String databaseName) {
+        Path database = directory.resolve(databaseName);
+        SqliteCustodianStore store = new SqliteCustodianStore(database);
+        MutableClock clock = new MutableClock(NOW);
+        PresenceService presences = new PresenceService(store, clock, Duration.ofSeconds(30));
+        return new Fixture(database, store, clock, new PaperShadowContributor(store, presences, clock));
+    }
+
+    private static ScopeContribution contribution(
+            BridgeHandle handle, UUID identity, String physicalInstance) {
+        ProcessEpoch publicEpoch = new ProcessEpoch(handle.epochId(), "opaque", NOW, NOW);
+        return new ScopeContribution(new ScannerScope(SCOPE), List.of(new PhysicalPresence(
+                identity, publicEpoch, new PhysicalInstance(physicalInstance), "shadow slot", NOW)));
+    }
+
+    private static int activeBridgeCount(Path database, String authority) {
+        try (var connection = DriverManager.getConnection("jdbc:sqlite:" + database.toAbsolutePath());
+             var query = connection.prepareStatement(
+                     "SELECT COUNT(*) FROM bridge_epochs WHERE authority_id=? AND active=1")) {
+            query.setString(1, authority);
+            try (var result = query.executeQuery()) {
+                assertTrue(result.next());
+                return result.getInt(1);
+            }
+        } catch (Exception failure) {
+            throw new AssertionError(failure);
+        }
+    }
+
+    private record Fixture(
+            Path database, SqliteCustodianStore store, MutableClock clock, PaperShadowContributor shadow)
+            implements AutoCloseable {
+        @Override public void close() { store.close(); }
+    }
+
+    private static final class MutableClock extends Clock {
+        private Instant instant;
+
+        private MutableClock(Instant instant) { this.instant = instant; }
+        void advance(Duration duration) { instant = instant.plus(duration); }
+        @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(ZoneId zone) {
+            if (!ZoneOffset.UTC.equals(zone)) throw new IllegalArgumentException("Only UTC is supported");
+            return this;
+        }
+        @Override public Instant instant() { return instant; }
+    }
+}

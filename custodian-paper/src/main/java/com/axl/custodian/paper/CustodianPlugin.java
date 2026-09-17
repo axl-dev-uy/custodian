@@ -21,18 +21,17 @@ public final class CustodianPlugin extends JavaPlugin {
             saveDefaultConfig();
             var presence = new PresenceService(store, java.time.Clock.systemUTC(), java.time.Duration.ofSeconds(getConfig().getLong("observation.freshness-seconds", 30)));
             api = new IdentityService(store, java.time.Clock.systemUTC(), presence);
-            shadow = new PaperShadowContributor(store, presence);
+            shadow = new PaperShadowContributor(store, presence, java.time.Clock.systemUTC());
             observation = new PaperObservationAdapter(this, presence, com.axl.custodian.api.AuthorityHandle.issuedByHost("custodian-native"),
                     getConfig().getString("server-id", "local"), java.time.Duration.ofSeconds(getConfig().getLong("observation.freshness-seconds", 30)), java.time.Clock.systemUTC());
             getServer().getPluginManager().registerEvents(observation, this);
-            getServer().getServicesManager().register(CustodianApi.class, api, this, org.bukkit.plugin.ServicePriority.Normal);
-            getServer().getServicesManager().register(com.axl.custodian.api.ShadowContributor.class, shadow, this, org.bukkit.plugin.ServicePriority.Normal);
+            PaperServiceRegistry.register(getServer().getServicesManager(), this, api, shadow);
         } catch (Exception failure) {
             getLogger().severe("Custodian could not establish its SQLite authority: " + failure.getMessage());
             getServer().getPluginManager().disablePlugin(this);
         }
     }
-    @Override public void onDisable() { if(shadow!=null)shadow.shutdown(); getServer().getServicesManager().unregisterAll(this); if (observation != null) observation.stop(); if (store != null) store.close(); }
+    @Override public void onDisable() { PaperServiceRegistry.unregister(getServer().getServicesManager(), this); if(shadow!=null)shadow.shutdown(); if (observation != null) observation.stop(); if (store != null) store.close(); }
     /** Registers a virtual custody provider. Providers are automatically removed when their owner disables. */
     public void registerPhysicalInventoryProvider(Plugin owner, PhysicalInventoryProvider provider) {
         if (observation == null) throw new IllegalStateException("Custodian is not enabled");

@@ -68,7 +68,13 @@ public final class SqliteCustodianStore implements CustodianStore {
         if (!migrationApplied(5)) {
             try (Statement s = connection.createStatement()) { s.executeUpdate("ALTER TABLE process_epochs ADD COLUMN authority_id TEXT"); s.executeUpdate("INSERT INTO schema_migrations(version, applied_at) VALUES (5, datetime('now'))"); }
         }
-        if (!migrationApplied(6)) { try(Statement s=connection.createStatement()){s.executeUpdate("CREATE TABLE bridge_epochs (epoch_id TEXT PRIMARY KEY, authority_id TEXT NOT NULL, server_id TEXT NOT NULL, started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, active INTEGER NOT NULL)");s.executeUpdate("INSERT INTO schema_migrations(version, applied_at) VALUES (6, datetime('now'))");} }
+        if (!migrationApplied(6)) {
+            try (Statement s = connection.createStatement()) {
+                s.executeUpdate("CREATE TABLE bridge_epochs (epoch_id TEXT PRIMARY KEY REFERENCES process_epochs(epoch_id), authority_id TEXT NOT NULL, server_id TEXT NOT NULL, started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, active INTEGER NOT NULL CHECK(active IN (0,1)))");
+                s.executeUpdate("CREATE UNIQUE INDEX active_bridge_authority_server ON bridge_epochs(authority_id, server_id) WHERE active=1");
+                s.executeUpdate("INSERT INTO schema_migrations(version, applied_at) VALUES (6, datetime('now'))");
+            }
+        }
     }
     private boolean migrationApplied(int version) throws SQLException { try (PreparedStatement q = connection.prepareStatement("SELECT 1 FROM schema_migrations WHERE version=?")) { q.setInt(1, version); try (ResultSet rs = q.executeQuery()) { return rs.next(); } } }
     @Override public synchronized Optional<IdentitySnapshot> findIdentity(UUID identity) {
@@ -150,17 +156,192 @@ public final class SqliteCustodianStore implements CustodianStore {
         try (PreparedStatement i=connection.prepareStatement("INSERT OR IGNORE INTO scope_owners(scope_id,authority_id) VALUES(?,?)")){i.setString(1,scopeId);i.setString(2,authorityId);i.executeUpdate();}catch(SQLException e){throw new StorageException("Unable to register scope",e);}
     }
     @Override public synchronized void bindEpoch(String authorityId, ProcessEpoch epoch) {
-        startEpoch(epoch);
-        try (PreparedStatement u=connection.prepareStatement("UPDATE process_epochs SET authority_id=? WHERE epoch_id=?")){u.setString(1,authorityId);u.setString(2,epoch.id().toString());u.executeUpdate();}catch(SQLException e){throw new StorageException("Unable to bind epoch",e);}
+        try (PreparedStatement existing = connection.prepareStatement(
+                "SELECT server_id,started_at,heartbeat_at,authority_id FROM process_epochs WHERE epoch_id=?")) {
+            existing.setString(1, epoch.id().toString());
+            try (ResultSet result = existing.executeQuery()) {
+                if (result.next()) {
+                    boolean sameEpoch = epoch.serverId().equals(result.getString("server_id"))
+                            && epoch.startedAt().equals(Instant.parse(result.getString("started_at")))
+                            && !epoch.heartbeatAt().isAfter(Instant.parse(result.getString("heartbeat_at")))
+                            && authorityId.equals(result.getString("authority_id"));
+                    if (!sameEpoch) throw new IllegalArgumentException("Epoch is already bound differently");
+                    return;
+                }
+            }
+        } catch (SQLException failure) {
+            throw new StorageException("Unable to read epoch binding", failure);
+        }
+        try (PreparedStatement insert = connection.prepareStatement(
+                "INSERT INTO process_epochs(epoch_id,server_id,started_at,heartbeat_at,authority_id) VALUES(?,?,?,?,?)")) {
+            insert.setString(1, epoch.id().toString());
+            insert.setString(2, epoch.serverId());
+            insert.setString(3, epoch.startedAt().toString());
+            insert.setString(4, epoch.heartbeatAt().toString());
+            insert.setString(5, authorityId);
+            insert.executeUpdate();
+        } catch (SQLException failure) {
+            throw new StorageException("Unable to bind epoch", failure);
+        }
     }
     @Override public synchronized Optional<String> scopeOwner(String scopeId) { try(PreparedStatement q=connection.prepareStatement("SELECT authority_id FROM scope_owners WHERE scope_id=?")){q.setString(1,scopeId);try(ResultSet r=q.executeQuery()){return r.next()?Optional.of(r.getString(1)):Optional.empty();}}catch(SQLException e){throw new StorageException("Unable to read scope owner",e);} }
     @Override public synchronized Optional<String> epochOwner(UUID epochId) { try(PreparedStatement q=connection.prepareStatement("SELECT authority_id FROM process_epochs WHERE epoch_id=?")){q.setString(1,epochId.toString());try(ResultSet r=q.executeQuery()){return r.next()&&r.getString(1)!=null?Optional.of(r.getString(1)):Optional.empty();}}catch(SQLException e){throw new StorageException("Unable to read epoch owner",e);} }
-    @Override public synchronized void startBridge(String a, ProcessEpoch e){try(PreparedStatement p=connection.prepareStatement("INSERT INTO bridge_epochs VALUES(?,?,?,?,?,1)")){p.setString(1,e.id().toString());p.setString(2,a);p.setString(3,e.serverId());p.setString(4,e.startedAt().toString());p.setString(5,e.heartbeatAt().toString());p.executeUpdate();}catch(SQLException x){throw new StorageException("Unable to start bridge",x);}}
-    @Override public synchronized void heartbeatBridge(UUID e,Instant t){try(PreparedStatement p=connection.prepareStatement("UPDATE bridge_epochs SET heartbeat_at=? WHERE epoch_id=? AND active=1")){p.setString(1,t.toString());p.setString(2,e.toString());if(p.executeUpdate()!=1)throw new IllegalArgumentException("Inactive bridge epoch");}catch(SQLException x){throw new StorageException("Unable to heartbeat bridge",x);}}
-    @Override public synchronized void invalidateBridge(UUID e){try(PreparedStatement p=connection.prepareStatement("UPDATE bridge_epochs SET active=0 WHERE epoch_id=?")){p.setString(1,e.toString());p.executeUpdate();}catch(SQLException x){throw new StorageException("Unable to invalidate bridge",x);}}
-    @Override public synchronized Optional<com.axl.custodian.core.BridgeLifecycle> bridge(UUID e){try(PreparedStatement p=connection.prepareStatement("SELECT authority_id,server_id,started_at,heartbeat_at,active FROM bridge_epochs WHERE epoch_id=?")){p.setString(1,e.toString());try(ResultSet r=p.executeQuery()){return r.next()?Optional.of(new com.axl.custodian.core.BridgeLifecycle(r.getString(1),e,r.getString(2),Instant.parse(r.getString(3)),Instant.parse(r.getString(4)),r.getInt(5)!=0)):Optional.empty();}}catch(SQLException x){throw new StorageException("Unable to read bridge",x);}}
+    @Override public synchronized void startBridge(String authorityId, ProcessEpoch epoch) {
+        try {
+            connection.setAutoCommit(false);
+            bindEpoch(authorityId, epoch);
+
+            Optional<com.axl.custodian.core.BridgeLifecycle> existing = bridge(epoch.id());
+            if (existing.isPresent()) {
+                com.axl.custodian.core.BridgeLifecycle lifecycle = existing.get();
+                boolean sameBridge = authorityId.equals(lifecycle.authorityId())
+                        && epoch.serverId().equals(lifecycle.serverId())
+                        && epoch.startedAt().equals(lifecycle.startedAt())
+                        && !epoch.heartbeatAt().isAfter(lifecycle.heartbeatAt());
+                if (!sameBridge) throw new IllegalArgumentException("Bridge epoch is already bound differently");
+                connection.commit();
+                return;
+            }
+
+            try (PreparedStatement active = connection.prepareStatement(
+                    "SELECT started_at FROM bridge_epochs WHERE authority_id=? AND server_id=? AND active=1")) {
+                active.setString(1, authorityId);
+                active.setString(2, epoch.serverId());
+                try (ResultSet result = active.executeQuery()) {
+                    if (result.next() && !epoch.startedAt().isAfter(Instant.parse(result.getString(1)))) {
+                        throw new IllegalArgumentException("Stale bridge epoch");
+                    }
+                }
+            }
+            try (PreparedStatement endPrevious = connection.prepareStatement(
+                    "UPDATE bridge_epochs SET active=0 WHERE authority_id=? AND server_id=? AND active=1");
+                 PreparedStatement insert = connection.prepareStatement(
+                         "INSERT INTO bridge_epochs(epoch_id,authority_id,server_id,started_at,heartbeat_at,active) VALUES(?,?,?,?,?,1)")) {
+                endPrevious.setString(1, authorityId);
+                endPrevious.setString(2, epoch.serverId());
+                endPrevious.executeUpdate();
+                insert.setString(1, epoch.id().toString());
+                insert.setString(2, authorityId);
+                insert.setString(3, epoch.serverId());
+                insert.setString(4, epoch.startedAt().toString());
+                insert.setString(5, epoch.heartbeatAt().toString());
+                insert.executeUpdate();
+            }
+            connection.commit();
+        } catch (IllegalArgumentException failure) {
+            rollback(failure);
+            throw failure;
+        } catch (SQLException failure) {
+            rollback(failure);
+            throw new StorageException("Unable to start bridge", failure);
+        } finally {
+            restoreAutoCommit();
+        }
+    }
+
+    @Override public synchronized void heartbeatBridge(UUID epochId, Instant observedAt) {
+        try {
+            connection.setAutoCommit(false);
+            Instant bridgeHeartbeat;
+            try (PreparedStatement query = connection.prepareStatement(
+                    "SELECT heartbeat_at,active FROM bridge_epochs WHERE epoch_id=?")) {
+                query.setString(1, epochId.toString());
+                try (ResultSet result = query.executeQuery()) {
+                    if (!result.next() || result.getInt("active") == 0) {
+                        throw new IllegalArgumentException("Inactive bridge epoch");
+                    }
+                    bridgeHeartbeat = Instant.parse(result.getString("heartbeat_at"));
+                }
+            }
+            if (observedAt.isBefore(bridgeHeartbeat)) {
+                throw new IllegalArgumentException("Stale bridge heartbeat");
+            }
+            try (PreparedStatement bridgeUpdate = connection.prepareStatement(
+                    "UPDATE bridge_epochs SET heartbeat_at=? WHERE epoch_id=? AND active=1");
+                 PreparedStatement epochQuery = connection.prepareStatement(
+                         "SELECT heartbeat_at FROM process_epochs WHERE epoch_id=?");
+                 PreparedStatement epochUpdate = connection.prepareStatement(
+                         "UPDATE process_epochs SET heartbeat_at=? WHERE epoch_id=?")) {
+                bridgeUpdate.setString(1, observedAt.toString());
+                bridgeUpdate.setString(2, epochId.toString());
+                if (bridgeUpdate.executeUpdate() != 1) throw new IllegalArgumentException("Inactive bridge epoch");
+
+                epochQuery.setString(1, epochId.toString());
+                try (ResultSet result = epochQuery.executeQuery()) {
+                    if (!result.next()) throw new IllegalArgumentException("Unbound bridge epoch");
+                    Instant processHeartbeat = Instant.parse(result.getString(1));
+                    if (observedAt.isAfter(processHeartbeat)) {
+                        epochUpdate.setString(1, observedAt.toString());
+                        epochUpdate.setString(2, epochId.toString());
+                        epochUpdate.executeUpdate();
+                    }
+                }
+            }
+            connection.commit();
+        } catch (IllegalArgumentException failure) {
+            rollback(failure);
+            throw failure;
+        } catch (SQLException failure) {
+            rollback(failure);
+            throw new StorageException("Unable to heartbeat bridge", failure);
+        } finally {
+            restoreAutoCommit();
+        }
+    }
+
+    @Override public synchronized void invalidateBridge(UUID epochId) {
+        try (PreparedStatement update = connection.prepareStatement(
+                "UPDATE bridge_epochs SET active=0 WHERE epoch_id=?")) {
+            update.setString(1, epochId.toString());
+            update.executeUpdate();
+        } catch (SQLException failure) {
+            throw new StorageException("Unable to invalidate bridge", failure);
+        }
+    }
+
+    @Override public synchronized Optional<com.axl.custodian.core.BridgeLifecycle> bridge(UUID epochId) {
+        try (PreparedStatement query = connection.prepareStatement(
+                "SELECT authority_id,server_id,started_at,heartbeat_at,active FROM bridge_epochs WHERE epoch_id=?")) {
+            query.setString(1, epochId.toString());
+            try (ResultSet result = query.executeQuery()) {
+                return result.next()
+                        ? Optional.of(new com.axl.custodian.core.BridgeLifecycle(
+                                result.getString("authority_id"), epochId, result.getString("server_id"),
+                                Instant.parse(result.getString("started_at")),
+                                Instant.parse(result.getString("heartbeat_at")), result.getInt("active") != 0))
+                        : Optional.empty();
+            }
+        } catch (SQLException failure) {
+            throw new StorageException("Unable to read bridge", failure);
+        }
+    }
     @Override public synchronized void releaseAuthority(String authorityId) {
-        try { connection.setAutoCommit(false); try (PreparedStatement p=connection.prepareStatement("DELETE FROM current_presence WHERE physical_instance LIKE ?"); PreparedStatement q=connection.prepareStatement("SELECT scope_id FROM scope_owners WHERE authority_id=?"); PreparedStatement d=connection.prepareStatement("DELETE FROM scope_owners WHERE authority_id=?")){q.setString(1,authorityId);try(ResultSet r=q.executeQuery()){while(r.next()){p.setString(1,r.getString(1)+":%");p.addBatch();}}p.executeBatch();d.setString(1,authorityId);d.executeUpdate();} connection.commit(); }catch(SQLException e){try{connection.rollback();}catch(SQLException x){e.addSuppressed(x);}throw new StorageException("Unable to release authority",e);}finally{try{connection.setAutoCommit(true);}catch(SQLException e){throw new StorageException("Unable to restore transaction mode",e);}}
+        try {
+            connection.setAutoCommit(false);
+            try (PreparedStatement presenceDelete = connection.prepareStatement("DELETE FROM current_presence WHERE physical_instance LIKE ?");
+                 PreparedStatement scopeQuery = connection.prepareStatement("SELECT scope_id FROM scope_owners WHERE authority_id=?");
+                 PreparedStatement scopeDelete = connection.prepareStatement("DELETE FROM scope_owners WHERE authority_id=?");
+                 PreparedStatement bridgeInvalidate = connection.prepareStatement("UPDATE bridge_epochs SET active=0 WHERE authority_id=?")) {
+                scopeQuery.setString(1, authorityId);
+                try (ResultSet result = scopeQuery.executeQuery()) {
+                    while (result.next()) {
+                        presenceDelete.setString(1, result.getString(1) + ":%");
+                        presenceDelete.addBatch();
+                    }
+                }
+                presenceDelete.executeBatch();
+                scopeDelete.setString(1, authorityId);
+                scopeDelete.executeUpdate();
+                bridgeInvalidate.setString(1, authorityId);
+                bridgeInvalidate.executeUpdate();
+            }
+            connection.commit();
+        } catch (SQLException failure) {
+            rollback(failure);
+            throw new StorageException("Unable to release authority", failure);
+        } finally {
+            restoreAutoCommit();
+        }
     }
     @Override public synchronized List<PhysicalPresence> activePresences(UUID identity, Instant freshAfter) {
         try (PreparedStatement q = connection.prepareStatement("SELECT p.server_id,p.process_epoch,p.physical_instance,p.location,p.observed_at,e.started_at,e.heartbeat_at FROM current_presence p JOIN process_epochs e ON e.epoch_id=p.process_epoch WHERE p.identity=? AND p.observed_at>=? AND e.heartbeat_at>=?")) {
@@ -173,5 +354,12 @@ public final class SqliteCustodianStore implements CustodianStore {
         } catch (SQLException failure) { throw new StorageException("Unable to remove epoch", failure); }
     }
     private static IdentitySnapshot snapshot(ResultSet rs) throws SQLException { return new IdentitySnapshot(UUID.fromString(rs.getString("identity")), IdentityState.valueOf(rs.getString("state")), IdentityOrigin.valueOf(rs.getString("origin")), rs.getString("authority_id"), Instant.parse(rs.getString("created_at")), Instant.parse(rs.getString("updated_at")), rs.getString("reason")); }
+    private void rollback(Exception failure) {
+        try { connection.rollback(); } catch (SQLException rollback) { failure.addSuppressed(rollback); }
+    }
+    private void restoreAutoCommit() {
+        try { connection.setAutoCommit(true); }
+        catch (SQLException failure) { throw new StorageException("Unable to restore SQLite transaction mode", failure); }
+    }
     @Override public synchronized void close() { try { connection.close(); } catch (SQLException failure) { throw new StorageException("Unable to close SQLite authority", failure); } }
 }
